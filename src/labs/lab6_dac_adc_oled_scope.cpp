@@ -14,6 +14,25 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 
+// 高速 ADC 连续采样（DMA）：用于把可测频率提升到 200kHz 量级
+// 说明：OLED/I2C 刷新速度很慢，不可能“实时逐点显示”200kHz；正确做法是：
+// 1) 先用 ADC 以高采样率快速采一段波形（DMA）
+// 2) 在内存里做频率/幅值计算
+// 3) 把这段数据下采样到 128 列再画到 OLED
+//
+// 这个模式默认开启；如要回到原来的“DAC->ADC 同步采样”教学版本，可在 build_flags 加：
+//   -D LAB6_FAST_ADC=0
+#ifndef LAB6_FAST_ADC
+#define LAB6_FAST_ADC 1
+#endif
+
+#if LAB6_FAST_ADC
+  // 兼容性优先：你当前这个 Arduino-ESP32 SDK 没有 adc_continuous.h
+  // 改用 I2S 内建 ADC DMA 采样（ESP32 经典款可用），同样能到 ~1MS/s。
+  #include <driver/i2s.h>
+  #include <driver/adc.h>
+#endif
+
 // OLED 驱动选择：有些模块虽然 I2C 地址同为 0x3C，但控制芯片不同。
 // - OLED_USE_SH1106=0: SSD1306（你这块屏目前是这个才能点亮）
 // - OLED_USE_SH1106=1: SH1106
@@ -37,9 +56,21 @@
 
 static const int DAC_PIN = 26;     // 25(DAC1) 或 26(DAC2)
 static const int ADC_PIN = 34;     // ADC1 引脚，推荐 34/35/36/39（输入专用）
-static const uint32_t SAMPLE_HZ = 4000;   // 采样率（Hz）
+static const uint32_t SAMPLE_HZ = 4000;   // (低速模式) 采样率（Hz）
 static const uint16_t N_SAMPLES = 128;    // OLED 宽 128，刚好一列一个采样点
 static const uint16_t WAVE_FREQ_HZ = 200;  // 目标输出频率（Hz）
+
+#if LAB6_FAST_ADC
+// 目标：可测到最高约 200kHz 的输入。
+// 经验上至少需要 >= 5x~10x 的过采样才“稳”；这里默认 1MS/s。
+static const uint32_t ADC_SAMPLE_HZ = 1000000;
+// 采集点数：越大频率估计越稳，但处理/显示会更慢；2048 点 @1MS/s 约 2.048ms。
+static const uint16_t ADC_CAPTURE_SAMPLES = 2048;
+static uint16_t adcRaw[ADC_CAPTURE_SAMPLES];
+static uint16_t samplesDisp[N_SAMPLES];
+
+static bool adcFastInited = false;
+#endif
 
 // DAC 更新率（点数/秒），越高波形越平滑（但 dacWrite() 有上限）
 static const uint32_t DAC_UPDATE_HZ = 20000;
@@ -131,6 +162,111 @@ static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET_PIN);
 
 // ===== 采样缓存 =====
 static uint16_t samples[N_SAMPLES];
+
+#if LAB6_FAST_ADC
+static adc1_channel_t adc1ChannelFromGpio(int gpio) {
+  // I2S ADC 仅支持 ADC1（ESP32 经典款），并且需要 adc1_channel_t。
+  // GPIO36->CH0, GPIO39->CH3, GPIO32->CH4, GPIO33->CH5, GPIO34->CH6, GPIO35->CH7
+  switch (gpio) {
+    case 36: return ADC1_CHANNEL_0;
+    case 39: return ADC1_CHANNEL_3;
+    case 32: return ADC1_CHANNEL_4;
+    case 33: return ADC1_CHANNEL_5;
+    case 34: return ADC1_CHANNEL_6;
+    case 35: return ADC1_CHANNEL_7;
+    default: return (adc1_channel_t)-1;
+  }
+}
+
+static bool adcFastInitOnce() {
+  if (adcFastInited) return true;
+
+  adc1_channel_t ch = adc1ChannelFromGpio(ADC_PIN);
+  if ((int)ch < 0) {
+    Serial.printf("FAST_ADC: unsupported ADC_PIN=%d (use ADC1: 32/33/34/35/36/39)\n", ADC_PIN);
+    return false;
+  }
+
+  // ADC1 配置
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ch, ADC_ATTEN_DB_11);
+
+  // I2S + ADC DMA 配置
+  i2s_config_t i2sCfg = {};
+  i2sCfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN);
+  i2sCfg.sample_rate = (int)ADC_SAMPLE_HZ;
+  i2sCfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  i2sCfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  i2sCfg.communication_format = I2S_COMM_FORMAT_I2S_MSB;
+  i2sCfg.intr_alloc_flags = 0;
+  i2sCfg.dma_buf_count = 4;
+  i2sCfg.dma_buf_len = 512;
+  i2sCfg.use_apll = false;
+  i2sCfg.tx_desc_auto_clear = false;
+  i2sCfg.fixed_mclk = 0;
+
+  esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2sCfg, 0, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("FAST_ADC: i2s_driver_install failed: %d\n", (int)err);
+    return false;
+  }
+
+  err = i2s_set_adc_mode(ADC_UNIT_1, ch);
+  if (err != ESP_OK) {
+    Serial.printf("FAST_ADC: i2s_set_adc_mode failed: %d\n", (int)err);
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+
+  err = i2s_adc_enable(I2S_NUM_0);
+  if (err != ESP_OK) {
+    Serial.printf("FAST_ADC: i2s_adc_enable failed: %d\n", (int)err);
+    i2s_driver_uninstall(I2S_NUM_0);
+    return false;
+  }
+
+  adcFastInited = true;
+  Serial.printf("FAST_ADC: I2S ADC started: pin=%d adc1_ch=%d fs=%luSa/s\n",
+                ADC_PIN,
+                (int)ch,
+                (unsigned long)ADC_SAMPLE_HZ);
+  return true;
+}
+
+static bool acquireAdcFast(uint16_t *out, uint16_t nSamples) {
+  if (!adcFastInitOnce()) return false;
+
+  // I2S 每次读一批 16-bit 样本
+  static uint16_t rx[1024];
+  uint32_t got = 0;
+  while (got < nSamples) {
+    size_t bytesRead = 0;
+    esp_err_t err = i2s_read(I2S_NUM_0, rx, sizeof(rx), &bytesRead, pdMS_TO_TICKS(50));
+    if (err != ESP_OK) {
+      Serial.printf("FAST_ADC: i2s_read failed: %d\n", (int)err);
+      return false;
+    }
+
+    uint32_t n16 = (uint32_t)(bytesRead / sizeof(uint16_t));
+    for (uint32_t i = 0; i < n16 && got < nSamples; i++) {
+      // ESP32 I2S ADC：通常是 12-bit 左对齐到 16-bit（>>4 得到 0..4095）
+      uint16_t raw = (uint16_t)((rx[i] >> 4) & 0x0FFF);
+      out[got++] = raw;
+    }
+  }
+  return true;
+}
+
+static void downsampleToOledColumns(const uint16_t *src, uint16_t srcN, uint16_t *dst, uint16_t dstN) {
+  // 用“每列取一个点”的最简单方式下采样（够用且开销低）
+  if (srcN == 0 || dstN == 0) return;
+
+  for (uint16_t x = 0; x < dstN; x++) {
+    uint32_t idx = (uint32_t)x * (uint32_t)(srcN - 1) / (uint32_t)(dstN - 1);
+    dst[x] = src[idx];
+  }
+}
+#endif
 
 static void i2cScanOnce() {
   Serial.println("I2C scan...");
@@ -232,7 +368,7 @@ static void acquireBlock(Waveform w) {
   }
 }
 
-static void computeMetrics(const uint16_t *buf, uint16_t n, float *outVpp, float *outFreq) {
+static void computeMetrics(const uint16_t *buf, uint16_t n, float sampleHz, float *outVpp, float *outFreq) {
   uint16_t vmin = 4095;
   uint16_t vmax = 0;
   uint32_t sum = 0;
@@ -273,7 +409,7 @@ static void computeMetrics(const uint16_t *buf, uint16_t n, float *outVpp, float
       // 线性插值估计 crossing 的小数采样点位置
       float denom = (b - a);
       float frac = (denom != 0.0f) ? (((mid + hyst) - a) / denom) : 0.0f;
-      float t = ((float)(i - 1) + frac) / (float)SAMPLE_HZ;
+      float t = ((float)(i - 1) + frac) / sampleHz;
 
       if (edges == 0) firstEdgeT = t;
       lastEdgeT = t;
@@ -380,7 +516,11 @@ void setup() {
 
 #if !LAB6_SCOPE_ONLY
   // ADC 配置
+  // - 低速模式用 analogRead()（简单，但采样率很低）
+  // - 高速模式用 adc_continuous(DMA)（用于 200kHz 量级测频）
+  #if !LAB6_FAST_ADC
   analogSetPinAttenuation(ADC_PIN, ADC_11db);
+  #endif
 
   // OLED
   Serial.printf("OLED cfg: driver=%s addr=0x%02X size=%dx%d I2C=%dHz SDA=%d SCL=%d RST=%d\n",
@@ -500,20 +640,44 @@ void loop() {
     Serial.printf("alive=%lums wave=%s (DAC-only)\n", (unsigned long)millis(), waveName(wave));
   }
 #else
-  acquireBlock(wave);
-
   float vpp = 0.0f;
   float freq = 0.0f;
-  computeMetrics(samples, N_SAMPLES, &vpp, &freq);
+
+  #if LAB6_FAST_ADC
+    // 高速采样：建议外部信号源直接输入 ADC_PIN（不要再依赖 DAC->ADC 那根线）
+    if (acquireAdcFast(adcRaw, ADC_CAPTURE_SAMPLES)) {
+      computeMetrics(adcRaw, ADC_CAPTURE_SAMPLES, (float)ADC_SAMPLE_HZ, &vpp, &freq);
+      downsampleToOledColumns(adcRaw, ADC_CAPTURE_SAMPLES, samplesDisp, (uint16_t)N_SAMPLES);
+    } else {
+      // 失败则保持上一次数据
+      freq = 0.0f;
+      vpp = 0.0f;
+    }
+  #else
+    acquireBlock(wave);
+    computeMetrics(samples, N_SAMPLES, (float)SAMPLE_HZ, &vpp, &freq);
+  #endif
 
   // 降低打印频率，避免刷屏；同时保证你随时打开串口都能看到输出
   if (millis() - lastHeartbeatMs >= 200) {
     lastHeartbeatMs = millis();
+    #if LAB6_FAST_ADC
+    Serial.printf("FAST_ADC  Vpp=%.2fV  f=%.1fHz  fs=%luSa/s  pin=%d\n",
+                  vpp,
+                  freq,
+                  (unsigned long)ADC_SAMPLE_HZ,
+                  ADC_PIN);
+    #else
     Serial.printf("%s  Vpp=%.2fV  f=%.1fHz  (target=%uHz)\n", waveName(wave), vpp, freq, (unsigned)WAVE_FREQ_HZ);
+    #endif
   }
 
   // 画图（若 OLED 没初始化成功，display.display() 会无效，不影响串口输出）
+  #if LAB6_FAST_ADC
+  drawWaveform(samplesDisp, (uint16_t)N_SAMPLES, wave, vpp, freq);
+  #else
   drawWaveform(samples, N_SAMPLES, wave, vpp, freq);
+  #endif
 
   delay(50);
 #endif
